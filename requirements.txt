@@ -1,0 +1,6 @@
+numpy
+panda
+scikit_learn
+torch
+torchvision
+torchaudio
