@@ -1,98 +1,81 @@
 import torch
+from torch.utils.data import DataLoader
 import pandas as pd
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+import torch.nn.functional as F  # 新增
 
-# 確保路徑正確，根據你的環境可能需要調整 import
+# 確保路徑正確
 from features.alignment import synthesize_mtf_data
 from features.preprocess import prepare_features
 from models.tcn_core import ParallelTCNAlphaHunter
 from data.dataset import CryptoTimeSeriesDataset
 from train import load_and_clean_data, CONFIG
 
-def run_vectorized_backtest(asset_name='BTCUSDT', fee_rate=0.001):
+def run_vectorized_backtest(asset_name='BTCUSDT', fee_rate=0.001, threshold=0.0):
     """
-    向量化回測：快速驗證模型在單一資產上的績效
     Args:
-        asset_name: 資產名稱
-        fee_rate: 手續費率 (0.001 = 0.1%)
+        threshold: 信心門檻 (0.0 代表不設限)。如果模型最大機率 < threshold，則強制 Hold。
     """
-    print(f"🧪 開始回測: {asset_name} | 手續費: {fee_rate*100:.2f}%")
+    print(f"🧪 開始回測: {asset_name} | 手續費: {fee_rate*100:.2f}% | 信心門檻: {threshold}")
     
-    # 1. 載入數據
+    # 1. 載入與處理數據
     filepath = os.path.join('data', 'raw', f'{asset_name}_1H.csv')
     if not os.path.exists(filepath):
-        print(f"❌ 找不到數據: {filepath}")
-        # Colab 路徑容錯 (有時候用戶會放在 content 根目錄)
+        # 嘗試直接讀取代碼所在目錄
         filepath = f'{asset_name}_1H.csv'
         if not os.path.exists(filepath):
-            print(f"❌ 也找不到根目錄數據: {filepath}，終止。")
+            print(f"❌ 找不到數據: {filepath}")
             return
-        else:
-            print(f"✅ 在根目錄找到數據: {filepath}")
 
     df = load_and_clean_data(filepath)
-    
-    # 2. 特徵工程 (必須與訓練時完全一致)
     print("🔄 處理特徵...")
     df_aligned = synthesize_mtf_data(df)
     
-    # 保留 Close 用於計算損益 (需與 Feature 對齊)
-    raw_close = df_aligned['close'].copy()
+    # 保留原始數據供後續分析
+    raw_df = df_aligned[['open', 'high', 'low', 'close']].copy()
     
-    # 生成特徵 (注意：回測時通常沒有 label，prepare_features 會處理特徵部分)
     df_features = prepare_features(df_aligned, method=CONFIG['norm_method'], window=30)
     df_features = df_features.dropna()
     
-    # --- 關鍵修復：注入 Dummy Label ---
-    # CryptoTimeSeriesDataset 預設需要 'label' 欄位，否則會報 KeyError
+    # 注入 Dummy Label
     if 'label' not in df_features.columns:
-        # 填入 0 (Hold) 作為佔位符，這不會影響模型推論(Inference)
         df_features['label'] = 0
-        print("🔧 已注入 Dummy Label 以符合 Dataset 格式要求")
     
-    # 對齊 raw_close (因為 dropna 移除了部分數據)
-    raw_close = raw_close.loc[df_features.index]
+    # 對齊原始價格
+    raw_df = raw_df.loc[df_features.index]
     
-    # 3. 載入模型
+    # 2. 載入模型
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"💻 使用裝置: {device}")
     
     model = ParallelTCNAlphaHunter(input_features=5, num_classes=3).to(device)
     
-    # 支援多種路徑檢查
+    # 尋找模型路徑
     possible_paths = [
         os.path.join('models', 'checkpoints', 'best_model.pth'),
-        'best_model.pth', # Colab 根目錄
-        '/content/models/checkpoints/best_model.pth'
+        'best_model.pth'
     ]
+    checkpoint_path = next((p for p in possible_paths if os.path.exists(p)), None)
     
-    checkpoint_path = None
-    for p in possible_paths:
-        if os.path.exists(p):
-            checkpoint_path = p
-            break
-            
     if checkpoint_path:
         print(f"🔄 載入模型: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-        print("✅ 模型載入成功")
+        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
     else:
-        print("❌ 找不到模型 Checkpoint (best_model.pth)")
+        print("❌ 找不到 best_model.pth")
         return
 
     model.eval()
     
-    # 4. 批量預測 (Batch Inference)
+    # 3. 推論 (含信心度)
     dataset = CryptoTimeSeriesDataset(df_features, seq_len=CONFIG['seq_len'])
-    loader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=False)
+    loader = DataLoader(dataset, batch_size=256, shuffle=False)
     
     all_preds = []
+    all_probs = [] # 儲存信心度
     
     print("🔮 執行推論...")
     with torch.no_grad():
@@ -102,76 +85,73 @@ def run_vectorized_backtest(asset_name='BTCUSDT', fee_rate=0.001):
             x_1d = batch['1d'].to(device)
             
             logits = model(x_1h, x_4h, x_1d)
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-            all_preds.extend(preds)
+            probs = F.softmax(logits, dim=1) # 轉成機率
             
-    # 5. 計算回測邏輯
-    # 注意: dataset[i] 的數據時間點是 T，標籤是對應 T+1 之後的未來
-    # 我們的模型在 T 時刻給出預測，我們在 T+1 開盤執行
-    
+            # 取得最大機率與對應類別
+            max_probs, preds = torch.max(probs, dim=1)
+            
+            # 如果信心不足，強制轉為 Hold (0)
+            if threshold > 0:
+                mask = max_probs < threshold
+                preds[mask] = 0
+                
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(max_probs.cpu().numpy())
+            
+    # 4. 構建詳細日誌 (Trade Log)
     valid_len = len(all_preds)
+    # 時間索引從 seq_len 之後開始
+    log_index = df_features.index[CONFIG['seq_len'] : CONFIG['seq_len']+valid_len]
     
-    # 分析用的 DataFrame (從 seq_len 之後開始)
-    analysis_df = pd.DataFrame(index=df_features.index[CONFIG['seq_len']:])
+    log_df = pd.DataFrame(index=log_index)
+    log_df['Close'] = raw_df['close'].iloc[CONFIG['seq_len'] : CONFIG['seq_len']+valid_len].values
+    log_df['Signal'] = all_preds
+    log_df['Confidence'] = all_probs
     
-    # 裁切長度以匹配預測結果
-    analysis_df = analysis_df.iloc[:valid_len].copy()
-    analysis_df['close'] = raw_close.iloc[CONFIG['seq_len']:].iloc[:valid_len].values
-    analysis_df['signal_idx'] = all_preds 
+    # 映射訊號: 0->0 (Hold), 1->1 (Long), 2->-1 (Short)
+    log_df['Position'] = log_df['Signal'].map({0: 0, 1: 1, 2: -1})
     
-    # 映射訊號: 0->0, 1->1 (Buy), 2->-1 (Sell)
-    # 假設 dataset.py 裡的轉換邏輯是: -1 -> 2, 0 -> 0, 1 -> 1
-    # 所以這裡要轉回來: 2 -> -1
-    signal_map = {0: 0, 1: 1, 2: -1}
-    analysis_df['position'] = analysis_df['signal_idx'].map(signal_map)
+    # 計算回報
+    log_df['Market_Ret'] = np.log(log_df['Close'] / log_df['Close'].shift(1)).fillna(0)
+    # 策略回報 = 昨天的部位 * 今天的漲跌
+    log_df['Strategy_Ret'] = log_df['Position'].shift(1) * log_df['Market_Ret']
     
-    # 計算市場回報 (Log Return)
-    analysis_df['market_return'] = np.log(analysis_df['close'] / analysis_df['close'].shift(1)).fillna(0)
+    # 計算手續費
+    log_df['Pos_Change'] = log_df['Position'].diff().abs().fillna(0)
+    log_df['Fees'] = log_df['Pos_Change'] * fee_rate
+    log_df['Net_Ret'] = log_df['Strategy_Ret'] - log_df['Fees']
     
-    # 策略回報
-    # 關鍵：今天的 Position 是由昨天的數據預測出來的 (shift(1))
-    # 這樣我們才能吃到今天的 market_return
-    analysis_df['strategy_return'] = analysis_df['position'].shift(1) * analysis_df['market_return']
+    # 累計淨值
+    log_df['Equity'] = (1 + log_df['Net_Ret']).cumprod()
+    log_df['Market_Equity'] = (1 + log_df['Market_Ret']).cumprod()
     
-    # 計算手續費 (只有當持倉改變時才扣費)
-    analysis_df['position_change'] = analysis_df['position'].diff().abs().fillna(0)
-    analysis_df['fees'] = analysis_df['position_change'] * fee_rate
-    
-    analysis_df['net_return'] = analysis_df['strategy_return'] - analysis_df['fees']
-    
-    # 累計回報 (權益曲線)
-    analysis_df['cum_market_return'] = analysis_df['market_return'].cumsum().apply(np.exp)
-    analysis_df['cum_strategy_return'] = analysis_df['net_return'].cumsum().apply(np.exp)
-    
-    # 6. 績效指標
-    total_ret = analysis_df['cum_strategy_return'].iloc[-1] - 1
-    # 夏普率 (假設無風險利率為 0，按小時數據年化)
-    sharpe = analysis_df['net_return'].mean() / (analysis_df['net_return'].std() + 1e-9) * np.sqrt(365*24)
-    
-    # 勝率 (不含 Hold)
-    trade_returns = analysis_df[analysis_df['position'].shift(1) != 0]['net_return']
-    win_rate = (trade_returns > 0).mean() if len(trade_returns) > 0 else 0
+    # 5. 輸出報告與檔案
+    total_ret = log_df['Equity'].iloc[-1] - 1
+    mkt_ret = log_df['Market_Equity'].iloc[-1] - 1
     
     print("\n" + "="*30)
-    print(f"📊 回測結果: {asset_name}")
-    print(f"   總回報: {total_ret*100:.2f}%")
-    print(f"   夏普率: {sharpe:.2f}")
-    print(f"   交易勝率: {win_rate*100:.2f}% (有開倉的時刻)")
-    print(f"   Buy & Hold: {(analysis_df['cum_market_return'].iloc[-1]-1)*100:.2f}%")
-    print("="*30 + "\n")
+    print(f"📊 詳細回測報告: {asset_name}")
+    print(f"   總回報: {total_ret*100:.2f}% (基準: {mkt_ret*100:.2f}%)")
+    print(f"   總交易次數: {log_df['Pos_Change'].sum()/2:.0f}")
+    print(f"   平均信心度: {np.mean(all_probs):.4f}")
+    print("="*30)
 
+    # 儲存詳細日誌 CSV
+    csv_filename = f'backtest_log_{asset_name}.csv'
+    log_df.to_csv(csv_filename)
+    print(f"💾 交易日誌已儲存: {csv_filename} (請下載並用 Excel 打開分析)")
+    
     # 繪圖
     plt.figure(figsize=(12, 6))
-    plt.plot(analysis_df.index, analysis_df['cum_market_return'], label='Buy & Hold', alpha=0.5)
-    plt.plot(analysis_df.index, analysis_df['cum_strategy_return'], label='Alpha Hunter', linewidth=2)
-    plt.title(f'Alpha Hunter Strategy Equity Curve ({asset_name})')
+    plt.plot(log_df.index, log_df['Market_Equity'], label='Market', alpha=0.5, color='gray')
+    plt.plot(log_df.index, log_df['Equity'], label='Strategy', linewidth=1.5, color='blue')
+    plt.title(f'Equity Curve: {asset_name} (Thresh={threshold})')
+    plt.yscale('log') # 使用對數坐標看清楚虧損
     plt.legend()
     plt.grid(True, alpha=0.3)
-    
-    output_img = f'backtest_{asset_name}.png'
-    plt.savefig(output_img)
-    print(f"📈 權益曲線已保存至 {output_img}")
+    plt.savefig(f'backtest_{asset_name}.png')
 
 if __name__ == "__main__":
-    # run_vectorized_backtest('BTCUSDT')
-    run_vectorized_backtest('ETHUSDT')
+    # 嘗試提高門檻，減少隨機交易
+    run_vectorized_backtest('BTCUSDT', fee_rate=0.001, threshold=0.0)
+    run_vectorized_backtest('ETHUSDT', fee_rate=0.001, threshold=0.0)
