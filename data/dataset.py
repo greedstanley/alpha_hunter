@@ -3,29 +3,48 @@ from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
 
-
 class CryptoTimeSeriesDataset(Dataset):
-
-    def __init__(self,
-                 features_df: pd.DataFrame,
-                 target_col: str = 'label',
-                 seq_len: int = 60):
+    def __init__(self, features_df: pd.DataFrame, target_col: str = 'label', seq_len: int = 60):
         """
         Args:
-            features_df: 已經標準化後的 DataFrame。
+            features_df: 已經標準化後的 DataFrame (包含 RSI, MACD 等所有特徵)。
             target_col: 標籤欄位名稱。
-            seq_len: TCN 的輸入序列長度 (Benchmark 變數: 30/40/60/80)。
+            seq_len: TCN 的輸入序列長度。
         """
-        # 分離特徵與標籤
-        self.labels = features_df[target_col].values
-        self.features = features_df.drop(columns=[target_col]).values
+        # 1. 分離特徵與標籤
+        if target_col in features_df.columns:
+            self.labels = features_df[target_col].values
+            self.features = features_df.drop(columns=[target_col])
+        else:
+            # 回測模式可能沒有 label，補 0
+            self.labels = np.zeros(len(features_df))
+            self.features = features_df
+            
         self.seq_len = seq_len
-
-        # 區分 1H, 4H, 1D 的欄位索引 (假設 preprocess 保持了順序)
-        # 這裡需要根據你的 synthesize_mtf_data 輸出的欄位順序做動態調整
-        # 為了簡化，我們假設 features 的欄位順序是:
-        # [1H_O, 1H_H..., 4H_O, 4H_H..., 1D_O, 1D_H...]
-        self.n_features_per_tf = 5  # OHLCV
+        self.feature_values = self.features.values
+        
+        # 2. 自動偵測特徵分配 (Auto-Discovery)
+        # 根據 preprocess.py 的命名規則：
+        # - 1D 特徵包含 '1d_'
+        # - 4H 特徵包含 '4h_'
+        # - 1H 特徵是剩下的 (open, close_rsi 等)
+        
+        all_cols = self.features.columns.tolist()
+        
+        # 找出欄位索引
+        self.idx_1d = [i for i, c in enumerate(all_cols) if '1d_' in c]
+        self.idx_4h = [i for i, c in enumerate(all_cols) if '4h_' in c]
+        # 1H 是排除掉 1d 和 4h 之後的所有欄位
+        self.idx_1h = [i for i, c in enumerate(all_cols) if i not in self.idx_1d and i not in self.idx_4h]
+        
+        # 計算特徵數量
+        self.n_feats_1h = len(self.idx_1h)
+        self.n_feats_4h = len(self.idx_4h)
+        self.n_feats_1d = len(self.idx_1d)
+        
+        # 驗證: 確保所有時間框架都有特徵，且最好維度一致 (雖然 TCNBranch 可以處理不同維度，但通常建議一致)
+        # 如果 preprocess.py 運作正常，這些應該都要是 8 (OHLCV + RSI + MACD + BBW)
+        # print(f"Features Debug: 1H={self.n_feats_1h}, 4H={self.n_feats_4h}, 1D={self.n_feats_1d}")
 
     def __len__(self):
         # 因為需要回看 seq_len，所以前 seq_len 筆資料無法當作 sample
@@ -33,36 +52,36 @@ class CryptoTimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         # 取出一段長度為 seq_len 的視窗
-        # X shape: (seq_len, total_features)
         window_start = idx
         window_end = idx + self.seq_len
-
-        X = self.features[window_start:window_end]
-
-        # 標籤取視窗最後一個時間點的標籤 (或是你定義的預測目標)
-        # 注意：這裡的 label 必須對應 window_end (當下時刻) 或是 window_end 的未來
-        # 根據我們的 labeling.py，label 是標記在 entry bar 的，所以取 window_end - 1
+        
+        # X shape: (seq_len, total_features)
+        X = self.feature_values[window_start:window_end]
+        
+        # 標籤取視窗最後一個時間點的標籤
         y = self.labels[window_end - 1]
-
-        # 將 Label 轉換為 0, 1, 2 (因為原始是 -1, 0, 1)
-        # -1 (Sell) -> 2
-        # 0 (Hold) -> 0
-        # 1 (Buy) -> 1
+        
+        # 根據索引提取不同時間框架的數據
+        # transpose(1, 0) 將 (Length, Feats) 轉為 (Feats, Length) 符合 PyTorch Conv1d
+        x_1h = X[:, self.idx_1h].transpose(1, 0)
+        x_4h = X[:, self.idx_4h].transpose(1, 0)
+        x_1d = X[:, self.idx_1d].transpose(1, 0)
+        
+        # 將 Label 轉換為 0, 1, 2
+        # -1 (Sell) -> 2, 0 (Hold) -> 0, 1 (Buy) -> 1
         if y == -1:
             y_mapped = 2
         else:
             y_mapped = int(y)
-
-        # 將 X 拆解為三個通道 (1H, 4H, 1D)
-        # 假設欄位順序是: 1h(5) + 4h(5) + 1d(5) = 15
-        # 轉置為 (Channels, Length) 符合 PyTorch Conv1d 格式
-        x_1h = X[:, 0:5].transpose()
-        x_4h = X[:, 5:10].transpose()
-        x_1d = X[:, 10:15].transpose()
-
+            
         return {
             '1h': torch.tensor(x_1h, dtype=torch.float32),
             '4h': torch.tensor(x_4h, dtype=torch.float32),
             '1d': torch.tensor(x_1d, dtype=torch.float32),
             'label': torch.tensor(y_mapped, dtype=torch.long)
         }
+    
+    def get_input_dim(self):
+        """返回 1H 通道的特徵數量，供模型初始化使用"""
+        # 假設所有通道特徵數相近，以 1H 為主
+        return self.n_feats_1h
