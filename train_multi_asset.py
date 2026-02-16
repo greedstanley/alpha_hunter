@@ -33,6 +33,21 @@ def process_single_asset(filepath):
 
     df = load_and_clean_data(filepath)
     df_aligned = synthesize_mtf_data(df)
+
+    df_labeled = apply_triple_barrier(df_aligned, horizon=CONFIG['horizon'], atr_period=CONFIG['atr_period'])
+    
+    # 統計標籤分佈
+    label_counts = df_labeled['label'].value_counts()
+    print(f"   📊 {os.path.basename(filepath)} 標籤分佈: {label_counts.to_dict()}")
+    
+    if len(label_counts) == 1 and 0 in label_counts:
+        print("   ❌ 警告：此資產完全沒有 Buy/Sell 訊號！請檢查數據品質或 ATR 參數。")
+    # ---------------------
+    
+    # 這裡會自動加入 RSI, MACD 等新特徵
+    df_final = prepare_features(df_labeled, method=CONFIG['norm_method'], window=30)
+    df_final = df_final.dropna()
+
     df_labeled = apply_triple_barrier(df_aligned, horizon=CONFIG['horizon'], atr_period=CONFIG['atr_period'])
     df_final = prepare_features(df_labeled, method=CONFIG['norm_method'], window=30)
     df_final = df_final.dropna()

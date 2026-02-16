@@ -69,4 +69,10 @@ def prepare_features(df: pd.DataFrame, method: str = 'z_score', window: int = 30
             bbw = calculate_bollinger_width(df[col])
             df_norm[f'{col}_bbw'] = calculate_z_score(bbw, window=window)
 
-    return df_norm.fillna(0)
+    df_norm = df_norm.fillna(0)
+
+    # 3. [重要修正] 補回 Label
+    if 'label' in df.columns:
+        df_norm['label'] = df['label']
+
+    return df_norm
