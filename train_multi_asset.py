@@ -19,8 +19,8 @@ CONFIG = {
     'seq_len': 60,
     'norm_method': 'z_score',
     'batch_size': 64,
-    'epochs': 50,
-    'learning_rate': 1e-3,
+    'epochs': 150,         # 目標延長至 150
+    'learning_rate': 1e-3, # 初始學習率
     'atr_period': 14,
     'horizon': 60,
     'pt_mul': 2.0,
@@ -33,21 +33,6 @@ def process_single_asset(filepath):
 
     df = load_and_clean_data(filepath)
     df_aligned = synthesize_mtf_data(df)
-
-    df_labeled = apply_triple_barrier(df_aligned, horizon=CONFIG['horizon'], atr_period=CONFIG['atr_period'])
-    
-    # 統計標籤分佈
-    label_counts = df_labeled['label'].value_counts()
-    print(f"   📊 {os.path.basename(filepath)} 標籤分佈: {label_counts.to_dict()}")
-    
-    if len(label_counts) == 1 and 0 in label_counts:
-        print("   ❌ 警告：此資產完全沒有 Buy/Sell 訊號！請檢查數據品質或 ATR 參數。")
-    # ---------------------
-    
-    # 這裡會自動加入 RSI, MACD 等新特徵
-    df_final = prepare_features(df_labeled, method=CONFIG['norm_method'], window=30)
-    df_final = df_final.dropna()
-
     df_labeled = apply_triple_barrier(df_aligned, horizon=CONFIG['horizon'], atr_period=CONFIG['atr_period'])
     df_final = prepare_features(df_labeled, method=CONFIG['norm_method'], window=30)
     df_final = df_final.dropna()
@@ -58,11 +43,12 @@ def process_single_asset(filepath):
     
     return train_df, val_df
 
-def save_checkpoint(model, optimizer, epoch, val_mcc, filename):
+def save_checkpoint(model, optimizer, scheduler, epoch, val_mcc, filename):
     state = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(), # 儲存排程器狀態
         'val_mcc': val_mcc,
         'config': CONFIG
     }
@@ -70,7 +56,7 @@ def save_checkpoint(model, optimizer, epoch, val_mcc, filename):
     print(f"    💾 Checkpoint saved: {filename} (MCC: {val_mcc:.4f})")
 
 def train_multi_asset_model(resume=False, additional_epochs=0):
-    print(f"🚀 啟動 Alpha Hunter [多幣種] 訓練程序...")
+    print(f"🚀 啟動 Alpha Hunter [多幣種] 訓練程序 (含 LR Scheduler)...")
     
     asset_files = glob.glob(os.path.join('data', 'raw', '*_1H.csv'))
     if not asset_files:
@@ -96,18 +82,14 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
         print("❌ 無有效數據，終止。")
         return
 
-    # [關鍵修復] 1. 掃描所有 Dataset 找出「全域最大特徵數」
+    # 全域特徵維度對齊
     all_dims = [ds.get_input_dim() for ds in train_datasets]
     global_max_dim = max(all_dims)
-    print(f"🧠 全域特徵維度對齊 (Global Feature Align): {all_dims} -> 統一為 {global_max_dim}")
+    print(f"🧠 全域特徵維度對齊: {all_dims} -> 統一為 {global_max_dim}")
 
-    # [關鍵修復] 2. 強制所有 Dataset 更新為全域維度 (Padding 不足的部分)
-    for ds in train_datasets:
-        ds.set_target_dim(global_max_dim)
-    for ds in val_datasets:
-        ds.set_target_dim(global_max_dim)
+    for ds in train_datasets: ds.set_target_dim(global_max_dim)
+    for ds in val_datasets: ds.set_target_dim(global_max_dim)
 
-    # 合併 Dataset
     combined_train = ConcatDataset(train_datasets)
     combined_val = ConcatDataset(val_datasets)
     
@@ -116,14 +98,16 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
     
     print(f"📊 總訓練樣本: {len(combined_train)} | 總驗證樣本: {len(combined_val)}")
 
-    # 初始化模型
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"💻 Device: {device}")
     
-    # 使用全域統一的維度
     model = ParallelTCNAlphaHunter(input_features=global_max_dim, num_classes=3).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
+    
+    # [新增] 學習率排程器：如果 MCC 15 個 Epoch 沒變好，LR 變成原本的 0.5 倍
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=15, verbose=True)
+    
     focal_loss = FocalLoss(alpha=torch.tensor([0.5, 1.0, 1.0]).to(device), gamma=2.0)
     
     checkpoint_dir = os.path.join('models', 'checkpoints')
@@ -144,22 +128,36 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
             first_layer_key = 'tcn_1h.network.0.conv1.weight'
             if first_layer_key in loaded_state_dict and \
                loaded_state_dict[first_layer_key].shape != current_model_dict[first_layer_key].shape:
-                print("⚠️  偵測到特徵維度改變。將捨棄舊權重，重新開始訓練。")
+                print("⚠️  維度改變，捨棄舊權重，重新開始。")
             else:
                 if 'model_state_dict' in checkpoint:
                     model.load_state_dict(checkpoint['model_state_dict'])
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    if 'scheduler_state_dict' in checkpoint:
+                        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                        
                     start_epoch = checkpoint['epoch'] + 1
                     best_val_mcc = checkpoint.get('val_mcc', 0.0)
-                    print(f"   ✅ 成功恢復狀態。上次停止於 Epoch {checkpoint['epoch']}, Best MCC: {best_val_mcc:.4f}")
+                    print(f"   ✅ 恢復狀態。上次停止於 Epoch {checkpoint['epoch']}, Best MCC: {best_val_mcc:.4f}")
                 else:
                     model.load_state_dict(checkpoint)
         except Exception as e:
-            print(f"❌ 載入失敗 ({e})，將重新開始訓練。")
+            print(f"❌ 載入失敗 ({e})，重新開始。")
             
     total_epochs = CONFIG['epochs']
     if resume:
-        total_epochs = start_epoch + additional_epochs
+        if additional_epochs > 0:
+            total_epochs = start_epoch + additional_epochs
+        else:
+            if start_epoch >= CONFIG['epochs']:
+                total_epochs = start_epoch + 20 # 自動延長 20
+                print(f"⚠️ 自動延長至 {total_epochs}...")
+            else:
+                total_epochs = CONFIG['epochs']
+        
+        print(f"🎯 續訓模式: {start_epoch} -> {total_epochs}")
+    else:
+        print(f"🎯 全新訓練: 目標 {total_epochs} Epochs")
 
     for epoch in range(start_epoch, total_epochs):
         model.train()
@@ -200,13 +198,15 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
         else:
             val_mcc = 0.0
 
-        print(f"Epoch {epoch+1}/{total_epochs} | Loss: {train_loss_avg:.4f} | Val MCC: {val_mcc:.4f}")
+        # 更新 Scheduler
+        scheduler.step(val_mcc)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch {epoch+1}/{total_epochs} | Loss: {train_loss_avg:.4f} | Val MCC: {val_mcc:.4f} | LR: {current_lr:.1e}")
         
         if val_mcc > best_val_mcc:
             best_val_mcc = val_mcc
-            save_checkpoint(model, optimizer, epoch, val_mcc, best_model_path)
+            save_checkpoint(model, optimizer, scheduler, epoch, val_mcc, best_model_path)
 
 if __name__ == "__main__":
-    train_multi_asset_model(resume=False)
-
-
+    train_multi_asset_model(resume=True, additional_epochs=150)
