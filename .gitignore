@@ -1,6 +1,5 @@
 venv/
 *.csv
-download.py
 *.png
 __pycache__/
 models/checkpoints/
