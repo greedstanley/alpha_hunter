@@ -32,7 +32,7 @@ def calculate_z_score(series: pd.Series, window: int = 30) -> pd.Series:
 
 def prepare_features(df: pd.DataFrame, method: str = 'z_score', window: int = 30) -> pd.DataFrame:
     """
-    增強版：加入 RSI, MACD, BB Width
+    增強版：加入 RSI, MACD, BB Width, 以及 Binance 外部特徵 (Funding, L/S Ratio)
     """
     df_norm = pd.DataFrame(index=df.index)
     
@@ -40,8 +40,15 @@ def prepare_features(df: pd.DataFrame, method: str = 'z_score', window: int = 30
     feature_cols = [c for c in df.columns if 'label' not in c and 'datetime' not in c]
     
     for col in feature_cols:
+        # 特別處理特定欄位
         if 'volume' in col:
             series = np.log(df[col] + 1)
+        elif 'funding_rate' in col:
+            # 資金費率通常很小且波動大，適合 Z-score
+            series = df[col]
+        elif 'ls_ratio' in col:
+            # 多空比 > 1 表示偏多，適合 Log 處理
+            series = np.log(df[col]) if (df[col] > 0).all() else df[col]
         else:
             series = df[col]
         

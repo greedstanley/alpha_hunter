@@ -10,6 +10,7 @@ import glob
 from features.alignment import synthesize_mtf_data
 from features.labeling import apply_triple_barrier
 from features.preprocess import prepare_features
+from features.binance_features import integrate_binance_features
 from models.tcn_core import ParallelTCNAlphaHunter
 from utils.loss import FocalLoss, calculate_mcc
 from data.dataset import CryptoTimeSeriesDataset
@@ -19,8 +20,8 @@ CONFIG = {
     'seq_len': 60,
     'norm_method': 'z_score',
     'batch_size': 64,
-    'epochs': 150,         # 目標延長至 150
-    'learning_rate': 1e-3, # 初始學習率
+    'epochs': 150,         
+    'learning_rate': 1e-3, # 保持 1e-3
     'atr_period': 14,
     'horizon': 60,
     'pt_mul': 2.0,
@@ -31,7 +32,16 @@ def process_single_asset(filepath):
     if not os.path.exists(filepath):
         return None, None
 
+    # 推斷 Symbol (例如 BTCUSDT_1H.csv -> BTCUSDT)
+    filename = os.path.basename(filepath)
+    symbol = filename.split('_')[0]
+
     df = load_and_clean_data(filepath)
+    
+    # [新增] 整合幣安外部特徵
+    print(f"🌐 抓取 Binance 外部數據 ({symbol})...")
+    df = integrate_binance_features(df, symbol)
+    
     df_aligned = synthesize_mtf_data(df)
     df_labeled = apply_triple_barrier(df_aligned, horizon=CONFIG['horizon'], atr_period=CONFIG['atr_period'])
     df_final = prepare_features(df_labeled, method=CONFIG['norm_method'], window=30)
@@ -43,17 +53,18 @@ def process_single_asset(filepath):
     
     return train_df, val_df
 
-def save_checkpoint(model, optimizer, scheduler, epoch, val_mcc, filename):
+def save_checkpoint(model, optimizer, scheduler, epoch, val_mcc, filename, quiet=False):
     state = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(), # 儲存排程器狀態
+        'scheduler_state_dict': scheduler.state_dict(),
         'val_mcc': val_mcc,
         'config': CONFIG
     }
     torch.save(state, filename)
-    print(f"    💾 Checkpoint saved: {filename} (MCC: {val_mcc:.4f})")
+    if not quiet:
+        print(f"    💾 Checkpoint saved: {filename} (MCC: {val_mcc:.4f})")
 
 def train_multi_asset_model(resume=False, additional_epochs=0):
     print(f"🚀 啟動 Alpha Hunter [多幣種] 訓練程序 (含 LR Scheduler)...")
@@ -105,8 +116,8 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
     
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
     
-    # [新增] 學習率排程器：如果 MCC 15 個 Epoch 沒變好，LR 變成原本的 0.5 倍
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=15, verbose=True)
+    # [修正] 移除 verbose=True 以解決 TypeError
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=15)
     
     focal_loss = FocalLoss(alpha=torch.tensor([0.5, 1.0, 1.0]).to(device), gamma=2.0)
     
@@ -114,6 +125,7 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
     if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
     
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+    latest_model_path = os.path.join(checkpoint_dir, 'latest_model.pth')
     
     start_epoch = 0
     best_val_mcc = -1.0
@@ -134,7 +146,10 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
                     model.load_state_dict(checkpoint['model_state_dict'])
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     if 'scheduler_state_dict' in checkpoint:
-                        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                        try:
+                            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                        except:
+                            print("⚠️  Scheduler 狀態載入失敗 (可能參數變更)，將使用新設定。")
                         
                     start_epoch = checkpoint['epoch'] + 1
                     best_val_mcc = checkpoint.get('val_mcc', 0.0)
@@ -150,7 +165,7 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
             total_epochs = start_epoch + additional_epochs
         else:
             if start_epoch >= CONFIG['epochs']:
-                total_epochs = start_epoch + 20 # 自動延長 20
+                total_epochs = start_epoch + 20 
                 print(f"⚠️ 自動延長至 {total_epochs}...")
             else:
                 total_epochs = CONFIG['epochs']
@@ -202,11 +217,14 @@ def train_multi_asset_model(resume=False, additional_epochs=0):
         scheduler.step(val_mcc)
         current_lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch+1}/{total_epochs} | Loss: {train_loss_avg:.4f} | Val MCC: {val_mcc:.4f} | LR: {current_lr:.1e}")
+        print(f"Epoch {epoch+1}/{total_epochs} | Loss: {train_loss_avg:.4f} | Val MCC: {val_mcc:.4f} (Best: {best_val_mcc:.4f}) | LR: {current_lr:.1e}")
         
+        # 儲存最新的模型
+        save_checkpoint(model, optimizer, scheduler, epoch, val_mcc, latest_model_path, quiet=True)
+
         if val_mcc > best_val_mcc:
             best_val_mcc = val_mcc
             save_checkpoint(model, optimizer, scheduler, epoch, val_mcc, best_model_path)
 
 if __name__ == "__main__":
-    train_multi_asset_model(resume=True, additional_epochs=150)
+    train_multi_asset_model(resume=True)

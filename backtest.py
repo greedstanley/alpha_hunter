@@ -193,6 +193,13 @@ def run_vectorized_backtest(asset_name='BTCUSDT', fee_rate=0.001, threshold=0.0)
     print(f"📈 圖片已儲存: {save_img}")
 
 if __name__ == "__main__":
-    # 可以針對訓練過的幣種進行回測
-    run_vectorized_backtest('BTCUSDT', fee_rate=0.001) # 0.1% 手續費
-    run_vectorized_backtest('ETHUSDT', fee_rate=0.001)
+    print("🔬 正在執行高門檻壓力測試...")
+    
+    # [修正] 將信心門檻從 0.0 提升到 0.55 或 0.60
+    # 意義：只有當模型預測某個方向的機率超過 55% 時才交易，否則空手 (Hold)
+    
+    # 測試 BTC
+    run_vectorized_backtest('BTCUSDT', fee_rate=0.001, threshold=0.6) 
+    
+    # 測試 ETH
+    run_vectorized_backtest('ETHUSDT', fee_rate=0.001, threshold=0.6)
