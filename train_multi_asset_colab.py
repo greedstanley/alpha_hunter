@@ -101,7 +101,7 @@ def train_multi_asset_model(data_directory, model_save_directory, resume=False, 
     if resume and os.path.exists(best_model_path):
         print(f"🔄 載入 Checkpoint: {best_model_path}")
         try:
-            checkpoint = torch.load(best_model_path, map_location=device)
+            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if 'scheduler_state_dict' in checkpoint:
