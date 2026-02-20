@@ -14,6 +14,13 @@ def fetch_funding_rate(symbol, limit=1000):
     try:
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
+
+        # [修復] 檢查API回傳的資料是否為有效的列表格式
+        if not isinstance(data, list) or not data:
+            # 如果不是列表或為空，可能是一個錯誤訊息，印出它以便診斷
+            print(f"⚠️ 抓取 Funding Rate 失敗 ({symbol}): API未回傳有效數據。回傳內容: {data}")
+            return pd.DataFrame()
+
         df = pd.DataFrame(data)
         df['fundingTime'] = pd.to_datetime(df['fundingTime'], unit='ms')
         df = df[['fundingTime', 'fundingRate']].rename(columns={'fundingTime': 'datetime', 'fundingRate': 'funding_rate'})
@@ -21,7 +28,8 @@ def fetch_funding_rate(symbol, limit=1000):
         df.set_index('datetime', inplace=True)
         return df
     except Exception as e:
-        print(f"⚠️ 抓取 Funding Rate 失敗 ({symbol}): {e}")
+        # 保留通用的 Exception 捕獲以應對網路問題等
+        print(f"⚠️ 抓取 Funding Rate 時發生預期外錯誤 ({symbol}): {e}")
         return pd.DataFrame()
 
 def fetch_long_short_ratio(symbol, period='1h', limit=500):
@@ -34,6 +42,13 @@ def fetch_long_short_ratio(symbol, period='1h', limit=500):
     try:
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
+
+        # [修復] 檢查API回傳的資料是否為有效的列表格式
+        if not isinstance(data, list) or not data:
+            # 如果不是列表或為空，可能是一個錯誤訊息，印出它以便診斷
+            print(f"⚠️ 抓取 Long/Short Ratio 失敗 ({symbol}): API未回傳有效數據。回傳內容: {data}")
+            return pd.DataFrame()
+
         df = pd.DataFrame(data)
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df = df[['timestamp', 'longShortRatio']].rename(columns={'timestamp': 'datetime', 'longShortRatio': 'ls_ratio'})
@@ -41,7 +56,8 @@ def fetch_long_short_ratio(symbol, period='1h', limit=500):
         df.set_index('datetime', inplace=True)
         return df
     except Exception as e:
-        print(f"⚠️ 抓取 Long/Short Ratio 失敗 ({symbol}): {e}")
+        # 保留通用的 Exception 捕獲以應對網路問題等
+        print(f"⚠️ 抓取 Long/Short Ratio 時發生預期外錯誤 ({symbol}): {e}")
         return pd.DataFrame()
 
 def integrate_binance_features(df, symbol):
