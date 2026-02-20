@@ -27,7 +27,7 @@ def process_single_asset(filepath, config=PIPELINE_CONFIG, save_csv=False):
     Args:
         filepath (str): 原始數據CSV檔案的路徑。
         config (dict): 處理管線的設定。
-        save_csv (bool): 是否將處理完成的訓練集儲存為CSV。
+        save_csv (bool): 是否將處理完成的訓練集和驗證集儲存為CSV。
 
     Returns:
         tuple: 一個包含 (train_df, val_df) 的元組，如果處理失敗則為 (None, None)。
@@ -71,14 +71,23 @@ def process_single_asset(filepath, config=PIPELINE_CONFIG, save_csv=False):
 
     if save_csv:
         try:
-            # ../data/raw/ -> ../data/
+            # --- 儲存訓練集 ---
             base_data_dir = os.path.dirname(os.path.dirname(filepath)) 
-            save_dir = os.path.join(base_data_dir, 'processed', 'train')
-            os.makedirs(save_dir, exist_ok=True)
+            train_save_dir = os.path.join(base_data_dir, 'processed', 'train')
+            os.makedirs(train_save_dir, exist_ok=True)
             
-            save_path = os.path.join(save_dir, f"{symbol}_train_processed.csv")
-            print(f"    💾 正在儲存處理後的訓練數據至: {save_path}")
-            train_df.to_csv(save_path)
+            train_save_path = os.path.join(train_save_dir, f"{symbol}_train_processed.csv")
+            print(f"    💾 正在儲存處理後的訓練數據至: {train_save_path}")
+            train_df.to_csv(train_save_path)
+
+            # --- [新增] 儲存驗證集 ---
+            val_save_dir = os.path.join(base_data_dir, 'processed', 'validation')
+            os.makedirs(val_save_dir, exist_ok=True)
+            
+            val_save_path = os.path.join(val_save_dir, f"{symbol}_validation_processed.csv")
+            print(f"    💾 正在儲存處理後的驗證數據至: {val_save_path}")
+            val_df.to_csv(val_save_path)
+
         except Exception as e:
             print(f"    ❌ 儲存CSV時發生錯誤: {e}")
 
